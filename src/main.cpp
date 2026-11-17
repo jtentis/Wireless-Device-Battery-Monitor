@@ -46,6 +46,7 @@ struct TrayEntry {
     DeviceStatus st;
     int lastPct = -1;        // last known percentage, kept while the device sleeps
     ULONGLONG lastSeen = 0;
+    SYSTEMTIME lastSeenAt{};  // wall-clock time of the last real reading
     bool added = false;
     bool lowWarned = false;
     std::wstring iconSig;    // what the current icon shows, to avoid needless redraws
@@ -231,8 +232,11 @@ std::wstring StatusText(const TrayEntry& e) {
     std::wstring t;
     if (!s.levelText.empty() && s.percent >= 0) t = s.levelText;
     else if (s.percent >= 0) t = std::to_wstring(s.percent) + L"%";
-    else if (e.lastPct >= 0) t = std::to_wstring(e.lastPct) + L"% (last known)";
-    else t = L"unknown";
+    else if (e.lastPct >= 0) {
+        wchar_t when[32];
+        swprintf(when, 32, L"%02d:%02d", e.lastSeenAt.wHour, e.lastSeenAt.wMinute);
+        return std::to_wstring(e.lastPct) + L"% (last seen " + when + L")";
+    } else t = L"unknown";
     if (s.charging) t += L", charging";
     if (s.asleep) t += L", asleep";
     return t;
@@ -355,18 +359,30 @@ void OnResults(std::vector<DeviceStatus>& results) {
     for (auto& s : results) {
         auto& e = g_entries[s.key];
         if (!e.uid) e.uid = StableId(s.key);
-        e.st = s;
-        if (s.percent >= 0) e.lastPct = s.percent;
-        e.lastSeen = GetTickCount64();
         seen[s.key] = true;
+        if (!s.connected && e.lastPct >= 0) {
+            // Receiver present but the device is asleep or off: keep its last value, dimmed.
+            e.st.percent = -1;
+            e.st.charging = false;
+            e.st.asleep = true;
+            ApplyEntry(e);
+            continue;
+        }
+        e.st = s;
+        if (s.percent >= 0) {
+            e.lastPct = s.percent;
+            GetLocalTime(&e.lastSeenAt);
+        }
+        e.lastSeen = GetTickCount64();
         ApplyEntry(e);
     }
     for (auto it = g_entries.begin(); it != g_entries.end();) {
         auto& e = it->second;
-        // Some receivers drop sleeping devices from the link; keep showing the last value for a while.
-        bool inGrace = !seen.count(it->first) && e.st.graceSec > 0 && e.st.connected &&
-                       GetTickCount64() - e.lastSeen < (ULONGLONG)e.st.graceSec * 1000;
+        // A device that stops answering (asleep, off, receiver unplugged) stays visible with its
+        // last known value for as long as the app runs.
+        bool inGrace = !seen.count(it->first) && e.lastPct >= 0;
         if (inGrace) {
+            e.st.connected = true;
             e.st.percent = -1;
             e.st.asleep = true;
             ApplyEntry(e);
