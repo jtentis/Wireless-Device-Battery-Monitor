@@ -22,6 +22,8 @@ void Destroy();
 bool Alive();
 void SetItems(const std::vector<WidgetItem>& items, const std::wstring& tooltip);
 void SetLightTheme(bool light);
+// true: far left of the taskbar; false (default): just left of the notification area.
+void SetAlignLeft(bool left);
 // Re-checks the taskbar layout and moves the widget if needed; call about once a second.
 // Returns false when the taskbar it was attached to is gone.
 bool Reposition();

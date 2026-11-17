@@ -12,6 +12,7 @@ std::vector<WidgetItem> g_items;
 std::wstring g_tipText;
 RECT g_lastTray{}, g_lastBar{};
 int g_lastW = -1, g_lastDpi = 0;
+bool g_alignLeft = false;
 SIZE g_size{};
 
 const wchar_t* kClass = L"WirelessBatteryWidget";
@@ -313,6 +314,12 @@ void SetLightTheme(bool light) {
     Paint();
 }
 
+void SetAlignLeft(bool left) {
+    g_alignLeft = left;
+    g_lastW = -1;  // force a move on the next Reposition
+    Reposition();
+}
+
 bool Reposition() {
     if (!Alive()) return false;
     if (Dpi() != g_lastDpi) { g_lastDpi = Dpi(); Paint(); }
@@ -323,10 +330,12 @@ bool Reposition() {
     GetWindowRect(g_taskbar, &bar);
     POINT p{ tr.left, bar.top };
     ScreenToClient(g_taskbar, &p);
-    int left = p.x - g_size.cx - Px(2);
+    // Right: just left of the notification area. Left: the far left edge (free on a centered
+    // Windows 11 taskbar).
+    int left = g_alignLeft ? Px(8) : p.x - g_size.cx - Px(2);
 
     // Windows 10: Explorer re-expands the task buttons on its own layout passes; narrow them again.
-    if (g_rebar && IsWindow(g_rebar)) {
+    if (!g_alignLeft && g_rebar && IsWindow(g_rebar)) {
         RECT rr;
         GetWindowRect(g_rebar, &rr);
         POINT tl{ rr.left, rr.top };
