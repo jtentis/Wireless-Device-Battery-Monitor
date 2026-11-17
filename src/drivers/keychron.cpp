@@ -29,32 +29,39 @@ bool LinkQuery(HidDev& d, BYTE cmd, std::vector<BYTE>& r, int timeoutMs) {
     }
 }
 
+// Keychron keyboards with the KC_GET_BATTERY patch, either behind a Keychron Link receiver or
+// plugged in directly with the cable (then the keyboard itself owns the FF60 interface).
 void PollKeychronLinkKeyboard(PollContext& ctx, USHORT vid, USHORT pid) {
     for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) { return c.page() == 0xFF60 && c.usage() == 0x61 && c.outLen() == 33; })) {
         HidDev d;
         if (!d.Open(*c)) continue;
         std::vector<BYTE> r;
-        if (!LinkQuery(d, 0xB2, r, 500)) continue;  // not a Keychron Link
         USHORT kbPid = 0;
-        int slots = r[1] < 5 ? r[1] : 5;
-        for (int i = 0; i < slots && 2 + 5 * i + 4 < (int)r.size(); i++) {
-            const BYTE* s = &r[2 + 5 * i];
-            if ((s[0] | (s[1] << 8)) == 0x3434 && s[4]) { kbPid = (USHORT)(s[2] | (s[3] << 8)); break; }
+        bool viaLink = LinkQuery(d, 0xB2, r, 500);
+        if (viaLink) {
+            int slots = r[1] < 5 ? r[1] : 5;
+            for (int i = 0; i < slots && 2 + 5 * i + 4 < (int)r.size(); i++) {
+                const BYTE* s = &r[2 + 5 * i];
+                if ((s[0] | (s[1] << 8)) == 0x3434 && s[4]) { kbPid = (USHORT)(s[2] | (s[3] << 8)); break; }
+            }
+            if (!kbPid) return;  // keyboard off, asleep or on the cable: the app keeps its last value
+            // After the link has been idle, the first request is lost while it wakes up (a stray
+            // reply arrives instead); a second one is answered within ~60 ms.
+            if (!LinkQuery(d, 0xA4, r, 1000) && !LinkQuery(d, 0xA4, r, 1000)) return;  // stock firmware
+        } else {
+            // Not a receiver (a keyboard answers B2 with VIA's "unhandled" FF): ask it directly.
+            kbPid = pid;
+            if (!LinkQuery(d, 0xA4, r, 500)) continue;  // stock firmware answers FF, never A4
         }
-        if (!kbPid) return;  // keyboard off or asleep: keep the last value for a while (graceSec)
-        // After the link has been idle, the first request is lost while it wakes up (a stray reply
-        // arrives instead); a second one is answered within ~60 ms. Stock firmware never answers.
-        bool ok = LinkQuery(d, 0xA4, r, 1000) || LinkQuery(d, 0xA4, r, 1000);
-        if (!ok || r[1] > 100) return;
+        if (r[1] > 100) return;
         DeviceStatus s;
-        s.key = L"keychron-kb:" + Hex4(kbPid);
+        s.key = L"keychron-kb:" + Hex4(kbPid);  // same key over the receiver and the cable
         s.name = (kbPid >= 0x0A50 && kbPid <= 0x0A58) ? L"Keychron K5 Max" : L"Keychron keyboard";
         s.kind = DeviceKind::Keyboard;
-        s.via = L"2.4 GHz receiver";
+        s.via = viaLink ? L"2.4 GHz receiver" : L"USB cable";
         s.percent = r[1];
         s.millivolts = r[2] | (r[3] << 8);
-        s.charging = r[4] == 1;
-        s.graceSec = 30 * 60;
+        s.charging = r[4] == 1;  // 0 on battery, 1 charging, 2 full
         ctx.Add(s, vid, pid);
         return;
     }
