@@ -1,10 +1,12 @@
-// Glorious (VID 258A), Hitscan (VID 3770) and G-Wolves (VID 33E4) wireless mice using the same
+// Glorious, Hitscan, G-Wolves and WLMouse wireless mice using the same
 // supplier protocol (G-Wolves calls it "XVI"; its other models use the Kysona protocol instead):
 // Request: 64-byte feature report (id 0), bytes [3]=02 [4]=02 [6]=83.
 // Reply:   [1]=status, [4]=02, [6]=83, [7]=charging (1), [8]=percent.
 // Status A1 = awake, A4 = asleep, A0 = waking up, others = unreachable.
 // Protocol: github.com/ikajdan/glorious-indicator, github.com/louis4craft/glorious-ctl,
 // Hitscan's web configurator (control.hitscan.com) and G-Wolves' (mouse.xyz, Config/env-models.json).
+// WLMouse's YING IDs: https://gm.wlmouse.gg/Config/env-models.json. The 1K dongle is shared
+// with other models; only the YING 8K receiver and its battery collection are matched here.
 #include "drivers.h"
 
 // Model names and cable product ids from G-Wolves' own device list (mouse.xyz/Config/env-models.json).
@@ -61,6 +63,7 @@ struct Vendor {
     int replyDelayMs;
     const wchar_t* (*name)(USHORT pid);
     bool (*isCable)(USHORT pid);
+    bool (*matches)(const HidColl&) = nullptr;
 };
 
 const wchar_t* GloriousName(USHORT pid) {
@@ -71,8 +74,20 @@ const wchar_t* GloriousName(USHORT pid) {
         case 0x2025: case 0x2014: return L"Glorious Model D- Wireless";
         case 0x2033: return L"Glorious Model O 2 Wireless";
         case 0x2034: case 0x2036: case 0x201A: return L"Glorious Model D 2 PRO";
-        default: return L"Glorious wireless mouse";
+        default: return nullptr;  // another brand on the same Sinowealth chip (e.g. Redragon keyboards)
     }
+}
+
+// 258A is Sinowealth's vendor id, shared by many brands. For a product we do not know, use the
+// device's own name and work out whether it is a keyboard or a mouse instead of assuming a mouse.
+DeviceKind SinowealthKind(const std::vector<HidColl>& all, USHORT vid, USHORT pid, const std::wstring& name) {
+    DeviceKind k = GuessKind(name);
+    if (k != DeviceKind::Other) return k;
+    int keyboards = 0;
+    for (const auto& c : all)
+        if (c.vid == vid && c.pid == pid && c.page() == 0x01 && c.usage() == 0x06) keyboards++;
+    if (keyboards >= 2) return DeviceKind::Keyboard;  // keyboards expose boot + NKRO keyboard collections
+    return KindFromCollections(all, vid, pid);
 }
 bool GloriousCable(USHORT pid) { return pid == 0x2011 || pid == 0x2012 || pid == 0x2013 || pid == 0x2014 || pid == 0x201A; }
 
@@ -89,6 +104,8 @@ const Vendor kVendors[] = {
     { 0x258A, L"glorious:", 50, GloriousName, GloriousCable },
     { 0x3770, L"hitscan:", 200, HitscanName, HitscanCable },
     { 0x33E4, L"gwolves:", 100, GWolvesModelName, GWolvesIsCable },
+    { 0x36A7, L"wlmouse:", 100, [](USHORT) { return L"WLMouse YING"; }, [](USHORT) { return false; },
+      [](const HidColl& c) { return c.pid == 0xA874 && c.page() == 0xFFFF && c.usage() == 0; } },
 };
 
 }  // namespace
@@ -96,7 +113,9 @@ const Vendor kVendors[] = {
 void PollGlorious(PollContext& ctx) {
     for (const Vendor& v : kVendors) {
         for (auto [vid, pid] : ctx.Products(v.vid)) {
-            for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) { return c.featLen() == 65; })) {
+            for (const HidColl* c : ctx.Find(vid, pid, [&v](const HidColl& c) {
+                     return c.featLen() == 65 && (!v.matches || v.matches(c));
+                 })) {
                 HidDev d;
                 if (!d.OpenFeatureOnly(*c)) continue;
                 std::vector<BYTE> r;
@@ -108,15 +127,22 @@ void PollGlorious(PollContext& ctx) {
                     Sleep(v.replyDelayMs);
                     if (!d.GetFeature(0, r) || r.size() < 9) break;
                     if (r[6] != 0x83 || (r[1] & 0xF0) != 0xA0) break;  // not this protocol
-                    ok = true;
                     if (r[1] == 0xA0 && attempt == 0) { Sleep(400); continue; }  // waking up: ask again
+                    ok = true;
                     break;
                 }
                 if (!ok) continue;
                 DeviceStatus s;
                 s.key = v.keyPrefix + Hex4(pid);
-                s.name = v.name(pid);
-                s.kind = DeviceKind::Mouse;
+                const wchar_t* known = v.name(pid);
+                if (known) {
+                    s.name = known;
+                    s.kind = DeviceKind::Mouse;
+                } else {
+                    s.name = HidProduct(*c);
+                    if (s.name.empty()) s.name = L"Wireless device";
+                    s.kind = SinowealthKind(ctx.colls, vid, pid, s.name);
+                }
                 s.via = v.isCable(pid) ? L"USB cable" : L"2.4 GHz receiver";
                 s.charging = v.isCable(pid) || r[7] == 0x01;
                 if (r[1] == 0xA1 && r[8] <= 100) s.percent = Clamp100(r[8] ? r[8] : 1);

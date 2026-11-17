@@ -1,3 +1,7 @@
+// The Windows HID backend. Linux uses hid_linux.cpp instead; this file is compiled only when
+// _WIN32 is defined so the existing Windows behaviour is byte-for-byte unchanged.
+#ifdef _WIN32
+
 #include "hid.h"
 
 #include <setupapi.h>
@@ -48,6 +52,14 @@ bool HidDev::Open(const HidColl& c) {
     c_ = c;
     h_ = CreateFileW(c.path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                      FILE_FLAG_OVERLAPPED, nullptr);
+    overlapped_ = true;
+    return ok();
+}
+
+bool HidDev::OpenReadOnly(const HidColl& c) {
+    Close();
+    c_ = c;
+    h_ = CreateFileW(c.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     overlapped_ = true;
     return ok();
 }
@@ -107,6 +119,31 @@ int HidDev::Read(std::vector<BYTE>& buf, int timeoutMs) {
     return (int)buf.size();
 }
 
+int HidDev::SetOutputAndRead(const std::vector<BYTE>& data, std::vector<BYTE>& buf, int timeoutMs) {
+    if (!ok() || !overlapped_ || !c_.inLen() || !c_.outLen() || data.empty()) return -1;
+    std::vector<BYTE> out(c_.outLen(), 0);
+    memcpy(out.data(), data.data(), std::min(out.size(), data.size()));
+    std::vector<BYTE> tmp(c_.inLen(), 0);
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    DWORD got = 0;
+    bool done = false;
+    if (ReadFile(h_, tmp.data(), (DWORD)tmp.size(), nullptr, &ov) || GetLastError() == ERROR_IO_PENDING) {
+        bool sent = HidD_SetOutputReport(h_, out.data(), (ULONG)out.size()) != FALSE;
+        if (sent && timeoutMs > 0 && WaitForSingleObject(ov.hEvent, (DWORD)timeoutMs) == WAIT_OBJECT_0) {
+            done = GetOverlappedResult(h_, &ov, &got, FALSE) != FALSE;
+        } else {
+            CancelIo(h_);
+            done = GetOverlappedResult(h_, &ov, &got, TRUE) != FALSE && sent;
+        }
+    }
+    CloseHandle(ov.hEvent);
+    if (!done || got == 0) return -1;
+    size_t off = tmp[0] == 0 ? 1 : 0;
+    buf.assign(tmp.begin() + off, tmp.begin() + got);
+    return (int)buf.size();
+}
+
 void HidDev::Flush() {
     if (ok()) HidD_FlushQueue(h_);
 }
@@ -123,6 +160,13 @@ bool HidDev::GetFeature(BYTE reportId, std::vector<BYTE>& out) {
     out.assign(c_.featLen(), 0);
     out[0] = reportId;
     return HidD_GetFeature(h_, out.data(), (ULONG)out.size()) != FALSE;
+}
+
+bool HidDev::GetInputReport(BYTE reportId, std::vector<BYTE>& out) {
+    if (!ok() || !c_.inLen()) return false;
+    out.assign(c_.inLen(), 0);
+    out[0] = reportId;
+    return HidD_GetInputReport(h_, out.data(), (ULONG)out.size()) != FALSE;
 }
 
 // ---- helpers ----------------------------------------------------------------------------------
@@ -189,3 +233,5 @@ DeviceKind KindFromCollections(const std::vector<HidColl>& all, USHORT vid, USHO
     if (kbd) return DeviceKind::Keyboard;
     return DeviceKind::Other;
 }
+
+#endif  // _WIN32

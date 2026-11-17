@@ -6,8 +6,10 @@
 #include <hidclass.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -25,7 +27,11 @@ constexpr DWORD POLL_INTERVAL_MS = 60 * 1000;
 constexpr int LOW_BATTERY = 15;
 constexpr UINT PLACEHOLDER_ID = 1;
 
-enum MenuId : UINT { ID_REFRESH = 100, ID_AUTOSTART, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_ALIGN_LEFT, ID_ALIGN_RIGHT };
+enum MenuId : UINT {
+    ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT, ID_ALIGN_LEFT, ID_ALIGN_RIGHT,
+    ID_DEVICE_FIRST = 1000
+};
+enum DeviceCmd : UINT { DEV_TOGGLE, DEV_LEFT, DEV_RIGHT, DEV_STRIDE = 4 };
 
 const wchar_t* kAppName = L"Wireless Battery";
 const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -38,8 +44,10 @@ HWND g_hwnd;
 HANDLE g_refreshEvt, g_stopEvt, g_worker;
 UINT g_taskbarCreatedMsg;
 bool g_lightTaskbar;
-bool g_wantWidget = true;  // user's choice: taskbar widget (default) or tray icons
-bool g_useWidget = false;  // what is actually shown right now
+bool g_wantWidget = true;      // user's choice: taskbar widget (default) or tray icons
+bool g_useWidget = false;      // what is actually shown right now
+bool g_hideLastKnown = false;  // hide (last known) / asleep devices from taskbar and tray
+bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
 
 struct TrayEntry {
     UINT uid = 0;
@@ -72,21 +80,79 @@ bool ReadLightTaskbar() {
     return false;
 }
 
+void ApplyMenuTheme(bool light) {
+    using SetPreferredAppModeFn = int(WINAPI*)(int);
+    using FlushMenuThemesFn = void(WINAPI*)();
+    static HMODULE ux = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static auto setMode = ux ? (SetPreferredAppModeFn)GetProcAddress(ux, MAKEINTRESOURCEA(135)) : nullptr;
+    static auto flush = ux ? (FlushMenuThemesFn)GetProcAddress(ux, MAKEINTRESOURCEA(136)) : nullptr;
+    if (setMode) setMode(light ? 3 : 2);
+    if (flush) flush();
+}
+
 std::wstring ExePath() {
     wchar_t p[MAX_PATH];
     GetModuleFileNameW(nullptr, p, MAX_PATH);
     return p;
 }
 
-bool LoadWidgetMode() {
-    DWORD v = 1, sz = sizeof(v);
-    RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"TaskbarWidget", RRF_RT_REG_DWORD, nullptr, &v, &sz);
+// Devices the user chose to hide (by key), stored as a REG_MULTI_SZ.
+std::set<std::wstring> g_hidden;
+
+void LoadHidden() {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"HiddenDevices", RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS || !size)
+        return;
+    std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, 0);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"HiddenDevices", RRF_RT_REG_MULTI_SZ, nullptr, buf.data(), &size) != ERROR_SUCCESS)
+        return;
+    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) g_hidden.insert(p);
+}
+
+void SaveHidden() {
+    std::wstring multi;
+    for (const auto& k : g_hidden) { multi += k; multi.push_back(L'\0'); }
+    multi.push_back(L'\0');
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"HiddenDevices", REG_MULTI_SZ, multi.data(), (DWORD)(multi.size() * sizeof(wchar_t)));
+}
+
+bool IsHidden(const std::wstring& key) { return g_hidden.count(key) != 0; }
+
+// The user's left-to-right order (device keys), stored as a REG_MULTI_SZ. Devices not in it follow
+// in the default order (by type, then name).
+std::vector<std::wstring> g_order;
+
+void LoadOrder() {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceOrder", RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS || !size)
+        return;
+    std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, 0);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceOrder", RRF_RT_REG_MULTI_SZ, nullptr, buf.data(), &size) != ERROR_SUCCESS)
+        return;
+    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) g_order.push_back(p);
+}
+
+void SaveOrder() {
+    if (g_order.size() > 64) g_order.resize(64);  // forget long-gone devices
+    std::wstring multi;
+    for (const auto& k : g_order) { multi += k; multi.push_back(L'\0'); }
+    multi.push_back(L'\0');
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceOrder", REG_MULTI_SZ, multi.data(), (DWORD)(multi.size() * sizeof(wchar_t)));
+}
+
+bool IsEntryHidden(const TrayEntry& e) {
+    return IsHidden(e.st.key) || (g_hideLastKnown && (e.st.asleep || (e.st.percent < 0 && e.lastPct >= 0)));
+}
+
+bool LoadBoolSetting(const wchar_t* name, bool defaultVal) {
+    DWORD v = defaultVal ? 1 : 0, sz = sizeof(v);
+    RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name, RRF_RT_REG_DWORD, nullptr, &v, &sz);
     return v != 0;
 }
 
-void SaveWidgetMode(bool on) {
+void SaveBoolSetting(const wchar_t* name, bool on) {
     DWORD v = on ? 1 : 0;
-    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"TaskbarWidget", REG_DWORD, &v, sizeof(v));
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, name, REG_DWORD, &v, sizeof(v));
 }
 
 bool LoadAlignLeft() {
@@ -99,6 +165,12 @@ void SaveAlignLeft(bool on) {
     DWORD v = on ? 1 : 0;
     RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"WidgetLeft", REG_DWORD, &v, sizeof(v));
 }
+bool LoadWidgetMode() { return LoadBoolSetting(L"TaskbarWidget", true); }
+void SaveWidgetMode(bool on) { SaveBoolSetting(L"TaskbarWidget", on); }
+bool LoadHideLastKnown() { return LoadBoolSetting(L"HideLastKnownDevices", false); }
+void SaveHideLastKnown(bool on) { SaveBoolSetting(L"HideLastKnownDevices", on); }
+bool LoadWidgetBackground() { return LoadBoolSetting(L"WidgetBackground", false); }
+void SaveWidgetBackground(bool on) { SaveBoolSetting(L"WidgetBackground", on); }
 
 bool AutostartEnabled() {
     wchar_t buf[MAX_PATH * 2];
@@ -248,6 +320,7 @@ std::wstring StatusText(const TrayEntry& e) {
         swprintf(when, 32, L"%02d:%02d", e.lastSeenAt.wHour, e.lastSeenAt.wMinute);
         return std::to_wstring(e.lastPct) + L"% (last seen " + when + L")";
     } else t = L"unknown";
+    if (!s.detail.empty() && s.percent >= 0) t += L" (" + s.detail + L")";
     if (s.charging) t += L", charging";
     if (s.asleep) t += L", asleep";
     return t;
@@ -301,7 +374,7 @@ void UpdatePlaceholder() {
 
 void ApplyEntry(TrayEntry& e) {
     const auto& s = e.st;
-    bool visible = s.connected && !g_useWidget;
+    bool visible = s.connected && !g_useWidget && !IsEntryHidden(e);
     if (!visible) {
         if (e.added) { TrayDelete(e.uid); e.added = false; }
         return;
@@ -328,25 +401,42 @@ void ApplyEntry(TrayEntry& e) {
     e.added = true;
 }
 
-int KindOrder(DeviceKind k) {  // headset first, then mouse, ... (matches the left-to-right layout)
+int KindOrder(DeviceKind k) {  // default order: headset first, then mouse, ...
     switch (k) {
         case DeviceKind::Headset:  return 0;
         case DeviceKind::Mouse:    return 1;
         case DeviceKind::Keyboard: return 2;
         case DeviceKind::Gamepad:  return 3;
-        default:                   return 4;
+        case DeviceKind::Phone:    return 4;
+        default:                   return 5;
     }
+}
+
+bool IsShown(const TrayEntry& e) { return e.st.connected && !IsEntryHidden(e); }
+
+// Entries in left-to-right order: the user's order first, then the rest by type and name. Works the
+// same for every kind of device (receivers, Bluetooth, controllers, HeadsetControl) as it only uses
+// the device key.
+std::vector<TrayEntry*> OrderedEntries(bool shownOnly) {
+    std::vector<TrayEntry*> list;
+    for (auto& [k, e] : g_entries)
+        if (!shownOnly || IsShown(e)) list.push_back(&e);
+    auto rank = [](const TrayEntry* e) {
+        auto it = std::find(g_order.begin(), g_order.end(), e->st.key);
+        return it == g_order.end() ? INT_MAX : (int)(it - g_order.begin());
+    };
+    std::stable_sort(list.begin(), list.end(), [&](const TrayEntry* a, const TrayEntry* b) {
+        int ra = rank(a), rb = rank(b);
+        if (ra != rb) return ra < rb;
+        int ka = KindOrder(a->st.kind), kb = KindOrder(b->st.kind);
+        return ka != kb ? ka < kb : a->st.name < b->st.name;
+    });
+    return list;
 }
 
 void UpdateWidget() {
     if (!g_useWidget) return;
-    std::vector<const TrayEntry*> list;
-    for (auto& [k, e] : g_entries)
-        if (e.st.connected) list.push_back(&e);
-    std::sort(list.begin(), list.end(), [](const TrayEntry* a, const TrayEntry* b) {
-        int ka = KindOrder(a->st.kind), kb = KindOrder(b->st.kind);
-        return ka != kb ? ka < kb : a->st.name < b->st.name;
-    });
+    std::vector<TrayEntry*> list = OrderedEntries(true);
     std::vector<WidgetItem> items;
     std::wstring tip;
     for (auto* e : list) {
@@ -357,6 +447,7 @@ void UpdateWidget() {
         it.charging = e->st.charging;
         it.dim = e->st.percent < 0;
         it.low = !it.charging && it.percent >= 0 && it.percent <= LOW_BATTERY;
+        it.bluetooth = e->st.via == L"Bluetooth";
         items.push_back(it);
         if (!tip.empty()) tip += L"\n";
         tip += e->st.name + L": " + StatusText(*e);
@@ -444,6 +535,20 @@ void SetMode(bool useWidget) {
     Reconcile();
 }
 
+void SetWidgetBackground(bool on) {
+    g_widgetBackground = on;
+    SaveWidgetBackground(on);
+    widget::SetBackground(on);
+}
+
+void SetHideLastKnown(bool on) {
+    g_hideLastKnown = on;
+    SaveHideLastKnown(on);
+    for (auto& [k, e] : g_entries) ApplyEntry(e);
+    UpdatePlaceholder();
+    UpdateWidget();
+}
+
 void ReAddAll() {
     g_placeholder = false;
     for (auto& [k, e] : g_entries) { e.added = false; ApplyEntry(e); }
@@ -460,17 +565,62 @@ void RedrawAll() {
     UpdatePlaceholder();
 }
 
+void ToggleHidden(const std::wstring& key) {
+    if (!g_hidden.erase(key)) g_hidden.insert(key);
+    SaveHidden();
+    auto it = g_entries.find(key);
+    if (it != g_entries.end()) ApplyEntry(it->second);
+    UpdatePlaceholder();
+    UpdateWidget();
+}
+
+// Swaps a shown device with its neighbour (dir -1 = left, +1 = right) and remembers the new order.
+void MoveEntry(const std::wstring& key, int dir) {
+    std::vector<TrayEntry*> list = OrderedEntries(true);
+    auto pos = std::find_if(list.begin(), list.end(), [&](const TrayEntry* e) { return e->st.key == key; });
+    if (pos == list.end()) return;
+    ptrdiff_t i = pos - list.begin(), j = i + dir;
+    if (j < 0 || j >= (ptrdiff_t)list.size()) return;
+    std::swap(list[i], list[j]);
+    std::vector<std::wstring> order;
+    for (auto* e : list) order.push_back(e->st.key);
+    for (auto& k : g_order)  // keep the places of devices that are not shown right now
+        if (std::find(order.begin(), order.end(), k) == order.end()) order.push_back(k);
+    g_order = order;
+    SaveOrder();
+    UpdateWidget();
+}
+
 void ShowMenu() {
+    ApplyMenuTheme(g_lightTaskbar);
     HMENU m = CreatePopupMenu();
-    if (g_entries.empty()) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"No devices with battery info found");
-    for (auto& [k, e] : g_entries) {
-        std::wstring line = e.st.name + L":  " + StatusText(e) + L"   [" + e.st.via + L"]";
-        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, line.c_str());
+    std::vector<std::wstring> keys;  // device index -> device key; menu id ID_DEVICE_FIRST + index * DEV_STRIDE + command
+    std::vector<TrayEntry*> all = OrderedEntries(false), shown = OrderedEntries(true);
+    if (all.empty()) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"No devices with battery info found");
+    else AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Point at a device to show, hide or move it");
+    for (TrayEntry* e : all) {
+        const std::wstring& k = e->st.key;
+        UINT base = ID_DEVICE_FIRST + (UINT)keys.size() * DEV_STRIDE;
+        auto pos = std::find(shown.begin(), shown.end(), e);
+        bool canLeft = pos != shown.end() && pos != shown.begin();
+        bool canRight = pos != shown.end() && pos + 1 != shown.end();
+        HMENU sub = CreatePopupMenu();
+        AppendMenuW(sub, MF_STRING | (IsHidden(k) ? 0 : MF_CHECKED), base + DEV_TOGGLE,
+                    g_wantWidget ? L"Show on the taskbar" : L"Show in the tray");
+        AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sub, MF_STRING | (canLeft ? 0 : MF_GRAYED), base + DEV_LEFT, g_wantWidget ? L"Move left" : L"Move up");
+        AppendMenuW(sub, MF_STRING | (canRight ? 0 : MF_GRAYED), base + DEV_RIGHT, g_wantWidget ? L"Move right" : L"Move down");
+        std::wstring line = e->st.name + L":  " + StatusText(*e) + L"   [" + e->st.via + L"]";
+        AppendMenuW(m, MF_POPUP | (IsHidden(k) ? 0 : MF_CHECKED), (UINT_PTR)sub, line.c_str());
+        keys.push_back(k);
     }
+    AppendMenuW(m, MF_STRING | (g_hideLastKnown ? MF_CHECKED : 0), ID_HIDE_LAST_KNOWN, L"Hide last known / asleep devices");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_wantWidget ? MF_CHECKED : 0), ID_MODE_WIDGET, L"Show on the taskbar (icon + percentage)");
     AppendMenuW(m, MF_STRING | (!g_wantWidget ? MF_CHECKED : 0), ID_MODE_TRAY, L"Show as tray icons");
     CheckMenuRadioItem(m, ID_MODE_WIDGET, ID_MODE_TRAY, g_wantWidget ? ID_MODE_WIDGET : ID_MODE_TRAY, MF_BYCOMMAND);
+    UINT bgFlags = MF_STRING | (g_widgetBackground ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED);
+    AppendMenuW(m, bgFlags, ID_WIDGET_BACKGROUND, L"Background behind taskbar text (for transparent taskbars)");
     if (g_wantWidget) {
         bool left = LoadAlignLeft();
         AppendMenuW(m, MF_STRING, ID_ALIGN_LEFT, L"    Left side of the taskbar");
@@ -480,6 +630,7 @@ void ShowMenu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_REFRESH, L"Refresh now");
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
+    AppendMenuW(m, MF_STRING, ID_SUPPORT, L"Support the project...");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
     POINT pt;
@@ -491,6 +642,8 @@ void ShowMenu() {
     switch (cmd) {
         case ID_REFRESH: SetEvent(g_refreshEvt); break;
         case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
+        case ID_HIDE_LAST_KNOWN: SetHideLastKnown(!g_hideLastKnown); break;
+        case ID_WIDGET_BACKGROUND: SetWidgetBackground(!g_widgetBackground); break;
         case ID_MODE_WIDGET: SetMode(true); break;
         case ID_MODE_TRAY: SetMode(false); break;
         case ID_ALIGN_LEFT:
@@ -498,7 +651,17 @@ void ShowMenu() {
             SaveAlignLeft(cmd == ID_ALIGN_LEFT);
             widget::SetAlignLeft(cmd == ID_ALIGN_LEFT);
             break;
+        case ID_SUPPORT: ShellExecuteW(nullptr, L"open", L"https://github.com/sponsors/krisgfx9", nullptr, nullptr, SW_SHOWNORMAL); break;
         case ID_EXIT: DestroyWindow(g_hwnd); break;
+        default:
+            if (cmd >= ID_DEVICE_FIRST && cmd < ID_DEVICE_FIRST + keys.size() * DEV_STRIDE) {
+                std::wstring key = keys[(cmd - ID_DEVICE_FIRST) / DEV_STRIDE];
+                switch ((cmd - ID_DEVICE_FIRST) % DEV_STRIDE) {
+                    case DEV_TOGGLE: ToggleHidden(key); break;
+                    case DEV_LEFT:   MoveEntry(key, -1); break;
+                    case DEV_RIGHT:  MoveEntry(key, +1); break;
+                }
+            }
     }
 }
 
@@ -556,7 +719,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SETTINGCHANGE:
             if (lp && !lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet")) {
                 bool light = ReadLightTaskbar();
-                if (light != g_lightTaskbar) { g_lightTaskbar = light; RedrawAll(); widget::SetLightTheme(light); }
+                if (light != g_lightTaskbar) { g_lightTaskbar = light; ApplyMenuTheme(light); RedrawAll(); widget::SetLightTheme(light); }
             }
             return 0;
         case WM_DESTROY:
@@ -601,6 +764,7 @@ int ListToConsole(bool dump) {
         else if (!s.levelText.empty()) line += s.levelText;
         else if (s.percent >= 0) line += std::to_wstring(s.percent) + L"%";
         else line += L"unknown";
+        if (!s.detail.empty()) line += L" (" + s.detail + L")";
         if (s.charging) line += L", charging";
         if (s.millivolts) line += L", " + std::to_wstring(s.millivolts) + L" mV";
         write(line + L"   (" + s.key + L")\n");
@@ -626,6 +790,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     g_lightTaskbar = ReadLightTaskbar();
+    ApplyMenuTheme(g_lightTaskbar);
     g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
     WNDCLASSEXW wc{ sizeof(wc) };
@@ -645,6 +810,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_refreshEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_stopEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_wantWidget = LoadWidgetMode();
+    g_hideLastKnown = LoadHideLastKnown();
+    g_widgetBackground = LoadWidgetBackground();
+    widget::SetBackground(g_widgetBackground);  // remembered by the widget across re-creation
+    LoadHidden();
+    LoadOrder();
     Reconcile();
     UpdatePlaceholder();  // something to click on until the first poll finishes
     SetTimer(g_hwnd, TIMER_WIDGET, 1000, nullptr);

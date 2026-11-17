@@ -1,5 +1,6 @@
 ; Inno Setup script for Wireless Battery (https://jrsoftware.org/isinfo.php).
-; Per-user install: no administrator rights needed, installs to %LOCALAPPDATA%\Programs.
+; Per-user install by default: no administrator rights needed, installs to %LOCALAPPDATA%\Programs.
+; Setup also offers "Install for all users" (Program Files, needs administrator rights).
 ; Build with installer\build-installer.ps1 (or: ISCC /DAppVersion=1.2.3 installer\WirelessBattery.iss).
 
 #ifndef AppVersion
@@ -17,6 +18,7 @@ DefaultDirName={autopf}\Wireless Battery
 DisableProgramGroupPage=yes
 DisableDirPage=auto
 PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
@@ -44,6 +46,7 @@ Name: "{autoprograms}\Wireless Battery"; Filename: "{app}\WirelessBattery.exe"
 
 [Run]
 Filename: "{app}\WirelessBattery.exe"; Description: "Start Wireless Battery now"; Flags: nowait postinstall skipifsilent
+Filename: "https://ko-fi.com/krisgfx"; Description: "Enjoying Wireless Battery? Support it on Ko-fi"; Flags: shellexec postinstall unchecked skipifsilent nowait runasoriginaluser
 
 [UninstallRun]
 Filename: "{app}\WirelessBattery.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitApp"
@@ -73,6 +76,55 @@ var
 begin
   if RegQueryStringValue(HKCU, RunKey, 'WirelessBattery', Value) and (CompareText(Value, InstalledRunValue()) = 0) then
     RegDeleteValue(HKCU, RunKey, 'WirelessBattery');
+end;
+
+{ True if this account can create the chosen folder (or write to it if it already exists).
+  Without administrator rights, folders such as D:\Programs or Program Files are often read-only. }
+function CanWriteTo(Dir: String): Boolean;
+var
+  Parent, Probe: String;
+begin
+  Dir := RemoveBackslashUnlessRoot(Dir);
+  if DirExists(Dir) then
+  begin
+    Probe := AddBackslash(Dir) + '~wirelessbattery-write-test.tmp';
+    Result := SaveStringToFile(Probe, '', False);
+    DeleteFile(Probe);
+    exit;
+  end;
+  { Find the nearest folder that exists and check that a new folder can be created in it. }
+  Parent := Dir;
+  while not DirExists(Parent) do
+  begin
+    if ExtractFileDir(Parent) = Parent then
+    begin
+      Result := False;  { the drive itself does not exist }
+      exit;
+    end;
+    Parent := ExtractFileDir(Parent);
+  end;
+  Probe := AddBackslash(Parent) + '~wirelessbattery-write-test';
+  Result := CreateDir(Probe);
+  if Result then
+    RemoveDir(Probe);
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  { Not in silent installs: there the wizard would wait on a hidden page forever. }
+  if (CurPageID = wpSelectDir) and not WizardSilent() and not CanWriteTo(WizardDirValue()) then
+  begin
+    if IsAdminInstallMode() then
+      MsgBox('Setup cannot create or write to this folder:' + #13#10 + WizardDirValue() + #13#10#13#10 +
+        'Please choose a different folder.', mbError, MB_OK)
+    else
+      MsgBox('Your account cannot create or write to this folder without administrator rights:' + #13#10 +
+        WizardDirValue() + #13#10#13#10 +
+        'Choose a folder you own (the default one always works), or close Setup, run it again and ' +
+        'pick "Install for all users".', mbError, MB_OK);
+    Result := False;
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

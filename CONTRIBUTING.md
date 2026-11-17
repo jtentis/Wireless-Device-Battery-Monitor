@@ -43,8 +43,7 @@ Please open an issue with:
    ```
 
 4. Declare the function in `src/drivers/drivers.h`, call it from `PollAllDevices()` in
-   `src/devices.cpp` (before the generic fallbacks), and add the file to `build.bat`.
-   The `Makefile` picks it up automatically.
+   `src/devices.cpp` (before the generic fallbacks). `build.bat` and the Makefile pick up new files automatically.
 5. Update the device table in `README.md`.
 
 ### Rules for drivers
@@ -53,9 +52,21 @@ Please open an issue with:
 - **Exact matching:** only talk to devices you recognise by vendor and product ID, or by a
   vendor-specific collection that is unique to the protocol.
 - **Always time out:** a missing device must not stall the poll for more than about a second.
+  Passive protocols may need longer to cover a documented push interval (for example, Delux and
+  Rapoo). Keep a single absolute deadline of at most 4 seconds per matching collection, do not
+  restart it for unrelated reports, and document why the exception is needed.
 - **Credit sources:** cite where the protocol comes from in a comment at the top of the file.
 
 ## Code style
 
 C++17, Win32 only, no third-party dependencies. Keep the binary small. Format roughly as the
 existing code does (4-space indent, 120-column lines).
+
+## Automatic safety check
+
+Every pull request is scanned by the "PR safety check" for things this app should never do (network
+access, launching programs, reading keyboard/clipboard/screen, startup entries, binaries, build or
+release changes). A flag is not a rejection: just explain the flagged lines in the PR description.
+
+Using AI tools is fine, but please remove `Co-authored-by` lines that credit them (for example
+`Co-authored-by: Claude ...`) from your commit messages. The check fails while they are present.

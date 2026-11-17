@@ -55,13 +55,21 @@ bool Arctis9(HidDev& d, USHORT pid, DeviceStatus& s) {
     return true;
 }
 
-// Arctis Pro Wireless: 41 AA -> [0]==02 offline; 40 AA -> [0] level 0..4.
+// Arctis Pro Wireless: 41 AA -> [0]==02 offline (04 online); 40 AA -> [0] level 0..4.
+// HeadsetControl writes 41 AA through hidapi, which treats the first byte as a report ID. That only
+// reaches the base station on Linux; interface 0 does not number its reports (33-byte output report
+// = ID 0 + 32 bytes), so on Windows the command has to go behind a 0 report ID or it never arrives.
+bool ArctisProCmd(HidDev& d, BYTE cmd, std::vector<BYTE>& r) {
+    if (WriteRead(d, { 0x00, cmd, 0xAA }, r) && !r.empty()) return true;
+    return WriteRead(d, { cmd, 0xAA }, r) && !r.empty();  // in case a firmware numbers its reports
+}
+
 bool ArctisProWireless(HidDev& d, USHORT pid, DeviceStatus& s) {
     std::vector<BYTE> r;
-    if (!WriteRead(d, { 0x41, 0xAA }, r) || r.empty()) return false;
+    if (!ArctisProCmd(d, 0x41, r)) return false;
     s = Headset(pid, L"SteelSeries Arctis Pro Wireless");
     s.connected = r[0] != 0x02;
-    if (s.connected && WriteRead(d, { 0x40, 0xAA }, r) && !r.empty()) s.percent = MapTo100(r[0], 0, 4);
+    if (s.connected && ArctisProCmd(d, 0x40, r) && r[0] <= 4) s.percent = MapTo100(r[0], 0, 4);
     return true;
 }
 
@@ -130,9 +138,11 @@ bool Aerox(HidDev& d, USHORT pid, DeviceStatus& s) {
                                                       : L"SteelSeries Prime Wireless";
     s = Mouse(pid, name, wired);
     int raw = r[1] & 0x7F;
-    s.charging = (r[1] & 0x80) != 0;
     if (raw == 0) s.connected = false;  // mouse off / out of range
-    else s.percent = Clamp100((raw - 1) * 5);
+    else if (raw <= 21) {  // only levels 1..21 represent 0..100%; invalid levels stay unknown
+        s.percent = (raw - 1) * 5;
+        s.charging = (r[1] & 0x80) != 0;
+    }
     return true;
 }
 
@@ -140,8 +150,10 @@ bool Aerox(HidDev& d, USHORT pid, DeviceStatus& s) {
 bool Rival(HidDev& d, USHORT pid, DeviceStatus& s) {
     std::vector<BYTE> r;
     if (!WriteRead(d, { 0x00, 0xAA, 0x01 }, r, 300) || r.size() < 3) return false;
-    s = Mouse(pid, pid == 0x172B ? L"SteelSeries Rival 650 Wireless" : pid == 0x1872 ? L"SteelSeries Rival 3 Wireless Gen 2" : L"SteelSeries Rival 3 Wireless",
+    bool rival650 = pid == 0x172B || pid == 0x1726;
+    s = Mouse(pid, rival650 ? L"SteelSeries Rival 650 Wireless" : pid == 0x1872 ? L"SteelSeries Rival 3 Wireless Gen 2" : L"SteelSeries Rival 3 Wireless",
               pid == 0x172B);
+    if (rival650) s.key = L"steelseries:172B";  // one entry whether it answers on the cable or the receiver
     s.percent = Clamp100(r[0]);
     s.charging = r[2] != 0;
     return true;
@@ -184,13 +196,13 @@ const Model kModels[] = {
     { { 0x1260, 0x12AD, 0x1252 }, PageFF43, Arctis7 },
     { { 0x12C2 }, Iface0, Arctis9 },
     { { 0x1290 }, Iface0, ArctisProWireless },
-    { { 0x12E0 }, Iface4, NovaProWireless },
+    { { 0x12E0, 0x225D }, Iface4, NovaProWireless },
     { { 0x220E, 0x2212, 0x2216, 0x2236, 0x2269, 0x226D, 0x2232, 0x2253, 0x230A, 0x2202, 0x22A1, 0x227E, 0x2206, 0x2258, 0x229E,
         0x22AD, 0x223A, 0x22A9, 0x227A, 0x22A4, 0x22A5, 0x220A, 0x22A7 },
       PageFFC0, NovaFamily },
     { { 0x1838, 0x183A, 0x1852, 0x1854, 0x1858, 0x185A, 0x1840, 0x1842 }, Iface3, Aerox },
     { { 0x1830, 0x1872 }, Iface3, Rival },
-    { { 0x172B }, Iface0, Rival },
+    { { 0x172B, 0x1726 }, Iface0, Rival },  // Rival 650: cable, 2.4 GHz receiver
     { { 0x1880 }, Iface2, RivalPro },
 };
 
@@ -203,7 +215,15 @@ void PollSteelSeries(PollContext& ctx) {
             for (const HidColl* c : ctx.Find(vid, pid, m.accept)) {
                 HidDev d;
                 DeviceStatus s;
-                if (d.Open(*c) && m.poll(d, pid, s)) { ctx.Add(s, vid, pid); break; }
+                if (!d.Open(*c) || !m.poll(d, pid, s)) continue;
+                // A Rival 650 charging on its cable can answer on both products; keep the cable's reading.
+                auto dup = std::find_if(ctx.out.begin(), ctx.out.end(), [&](const DeviceStatus& o) { return o.key == s.key; });
+                if (dup == ctx.out.end()) ctx.Add(s, vid, pid);
+                else {
+                    if (s.via == L"USB cable") *dup = s;
+                    ctx.Claim(vid, pid);
+                }
+                break;
             }
             break;
         }

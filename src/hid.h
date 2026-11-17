@@ -6,12 +6,23 @@
 //    the buffer is zero-padded to the report length.
 //  * Read: a leading 0 report ID is stripped, so data[0] is the first payload byte for
 //    unnumbered reports and the report ID for numbered ones.
-#include <windows.h>
-// Older MinGW-w64 headers (e.g. the one bundled with Strawberry Perl) lack extern "C" here.
+#include "platform_compat.h"
+
+#ifdef _WIN32
+// Older MinGW-w64 headers (e.g. Strawberry Perl's) lack extern "C" here.
 extern "C" {
 #include <hidsdi.h>
 #include <hidpi.h>
 }
+#else
+// Only the fields used by HidColl's accessors are needed by the portable drivers.
+struct HIDP_CAPS {
+    USHORT UsagePage = 0, Usage = 0;
+    USHORT InputReportByteLength = 0;
+    USHORT OutputReportByteLength = 0;
+    USHORT FeatureReportByteLength = 0;
+};
+#endif
 
 #include <initializer_list>
 #include <string>
@@ -21,6 +32,7 @@ extern "C" {
 
 struct HidColl {
     std::wstring path;
+    std::wstring product;  // filled by the Linux backend from sysfs; unused on Windows
     USHORT vid = 0, pid = 0;
     int iface = -1;  // USB interface number (MI_xx in the path), -1 when unknown
     HIDP_CAPS caps{};
@@ -41,23 +53,36 @@ public:
     HidDev& operator=(const HidDev&) = delete;
 
     bool Open(const HidColl& c);            // read/write, overlapped
+    bool OpenReadOnly(const HidColl& c);    // read only, overlapped: for push-only collections another app may hold
     bool OpenFeatureOnly(const HidColl& c);  // zero access: enough for feature reports, works on mice/keyboards
     void Close();
+#ifdef _WIN32
     bool ok() const { return h_ != INVALID_HANDLE_VALUE; }
+#else
+    bool ok() const { return fd_ >= 0; }
+#endif
     const HidColl& coll() const { return c_; }
 
     bool Write(const std::vector<BYTE>& data, int timeoutMs = 500);
     bool Write(std::initializer_list<BYTE> data, int timeoutMs = 500) { return Write(std::vector<BYTE>(data), timeoutMs); }
     // Reads one input report into `buf` (resized to fit). Returns the byte count, or -1 on timeout/error.
     int Read(std::vector<BYTE>& buf, int timeoutMs);
+    // For collections without an interrupt OUT pipe (WriteFile fails there): arms a read, sends
+    // `data` with HidD_SetOutputReport, and returns the first input report like Read() does.
+    int SetOutputAndRead(const std::vector<BYTE>& data, std::vector<BYTE>& buf, int timeoutMs);
     void Flush();  // discard queued input reports
 
     bool SetFeature(const std::vector<BYTE>& data);
     bool GetFeature(BYTE reportId, std::vector<BYTE>& out);  // out[0] = report ID
+    bool GetInputReport(BYTE reportId, std::vector<BYTE>& out);  // current input report via the control pipe; out[0] = report ID
 
 private:
+#ifdef _WIN32
     HANDLE h_ = INVALID_HANDLE_VALUE;
     bool overlapped_ = false;
+#else
+    int fd_ = -1;  // /dev/hidrawN
+#endif
     HidColl c_;
 };
 

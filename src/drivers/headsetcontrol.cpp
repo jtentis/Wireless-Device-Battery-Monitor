@@ -157,33 +157,31 @@ std::string Run(std::wstring cmd, int timeoutMs) {
     return out;
 }
 
-}  // namespace
+// One headset as last reported by HeadsetControl.
+struct HscDevice { USHORT vid, pid; DeviceStatus status; };
 
-void PollHeadsetControl(PollContext& ctx) {
-    static std::wstring exe = FindExe();
-    if (exe.empty()) return;
-    std::string text = Run(L"\"" + exe + L"\" -o json", 8000);
+std::vector<HscDevice> Parse(const std::string& text) {
+    std::vector<HscDevice> out;
     size_t start = text.find('{');
-    if (start == std::string::npos) return;
+    if (start == std::string::npos) return out;
     Json root;
     Parser ps{ text.c_str() + start, text.c_str() + text.size() };
-    if (!ps.parse(root) || root.type != Json::Obj) return;
+    if (!ps.parse(root) || root.type != Json::Obj) return out;
     const Json* devices = root.get("devices");
-    if (!devices || devices->type != Json::Arr) return;
-
+    if (!devices || devices->type != Json::Arr) return out;
     for (const Json& d : devices->arr) {
         const Json* vidJ = d.get("id_vendor");
         const Json* pidJ = d.get("id_product");
         const Json* bat = d.get("battery");
         if (!vidJ || !pidJ || !bat || bat->type != Json::Obj) continue;
-        USHORT vid = (USHORT)strtoul(vidJ->str.c_str(), nullptr, 16);
-        USHORT pid = (USHORT)strtoul(pidJ->str.c_str(), nullptr, 16);
-        if (ctx.IsClaimed(vid, pid)) continue;
+        HscDevice h;
+        h.vid = (USHORT)strtoul(vidJ->str.c_str(), nullptr, 16);
+        h.pid = (USHORT)strtoul(pidJ->str.c_str(), nullptr, 16);
         const Json* status = bat->get("status");
         const Json* level = bat->get("level");
         std::string st = status ? status->str : "";
-        DeviceStatus s;
-        s.key = L"hsc:" + Hex4(vid) + L":" + Hex4(pid);
+        DeviceStatus& s = h.status;
+        s.key = L"hsc:" + Hex4(h.vid) + L":" + Hex4(h.pid);
         const Json* name = d.get("device");
         s.name = name && !name->str.empty() ? Widen(name->str) : L"Headset";
         s.kind = DeviceKind::Headset;
@@ -191,6 +189,58 @@ void PollHeadsetControl(PollContext& ctx) {
         s.charging = st == "BATTERY_CHARGING";
         s.connected = st == "BATTERY_AVAILABLE" || st == "BATTERY_CHARGING";
         if (s.connected && level && level->type == Json::Num && level->num >= 0) s.percent = Clamp100((int)level->num);
-        ctx.Add(s, vid, pid);
+        out.push_back(h);
     }
+    return out;
+}
+
+// HeadsetControl can take several seconds per headset, so it runs on its own thread and the regular
+// poll uses its latest result instead of waiting for it. Only the battery is requested (-b), with
+// a short HID timeout so a sleeping headset cannot stall it.
+SRWLOCK g_lock = SRWLOCK_INIT;
+std::vector<HscDevice> g_devices;
+ULONGLONG g_updated = 0;
+LONG g_running = 0;
+
+std::wstring Command() {
+    static std::wstring exe = FindExe();
+    if (exe.empty()) return L"";
+    std::wstring cmd = L"\"" + exe + L"\" -b -o json --timeout 1500";
+    wchar_t test[8];
+    if (GetEnvironmentVariableW(L"WB_HSC_TEST_DEVICE", test, 8)) cmd += L" --test-device";  // for development
+    return cmd;
+}
+
+void Refresh() {
+    std::wstring cmd = Command();
+    std::vector<HscDevice> found = cmd.empty() ? std::vector<HscDevice>{} : Parse(Run(cmd, 30000));
+    AcquireSRWLockExclusive(&g_lock);
+    g_devices = found;
+    g_updated = GetTickCount64();
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
+DWORD WINAPI RefreshThread(LPVOID) {
+    Refresh();
+    InterlockedExchange(&g_running, 0);
+    return 0;
+}
+
+}  // namespace
+
+void PollHeadsetControl(PollContext& ctx) {
+    if (Command().empty()) return;
+    ULONGLONG now = GetTickCount64();
+    if (g_updated == 0) {
+        Refresh();  // first poll: wait for it, so the first display (and --list) is complete
+    } else if (now - g_updated > 50000 && InterlockedCompareExchange(&g_running, 1, 0) == 0) {
+        HANDLE t = CreateThread(nullptr, 0, RefreshThread, nullptr, 0, nullptr);
+        if (t) CloseHandle(t);
+        else InterlockedExchange(&g_running, 0);
+    }
+    AcquireSRWLockShared(&g_lock);
+    std::vector<HscDevice> devices = g_devices;
+    ReleaseSRWLockShared(&g_lock);
+    for (const HscDevice& h : devices)
+        if (!ctx.IsClaimed(h.vid, h.pid)) ctx.Add(h.status, h.vid, h.pid);
 }
