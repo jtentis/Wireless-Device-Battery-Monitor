@@ -25,7 +25,7 @@ constexpr DWORD POLL_INTERVAL_MS = 60 * 1000;
 constexpr int LOW_BATTERY = 15;
 constexpr UINT PLACEHOLDER_ID = 1;
 
-enum MenuId : UINT { ID_REFRESH = 100, ID_AUTOSTART, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY };
+enum MenuId : UINT { ID_REFRESH = 100, ID_AUTOSTART, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_ALIGN_LEFT, ID_ALIGN_RIGHT };
 
 const wchar_t* kAppName = L"Wireless Battery";
 const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -87,6 +87,17 @@ bool LoadWidgetMode() {
 void SaveWidgetMode(bool on) {
     DWORD v = on ? 1 : 0;
     RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"TaskbarWidget", REG_DWORD, &v, sizeof(v));
+}
+
+bool LoadAlignLeft() {
+    DWORD v = 0, sz = sizeof(v);
+    RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"WidgetLeft", RRF_RT_REG_DWORD, nullptr, &v, &sz);
+    return v != 0;
+}
+
+void SaveAlignLeft(bool on) {
+    DWORD v = on ? 1 : 0;
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"WidgetLeft", REG_DWORD, &v, sizeof(v));
 }
 
 bool AutostartEnabled() {
@@ -381,6 +392,14 @@ void OnResults(std::vector<DeviceStatus>& results) {
         // A device that stops answering (asleep, off, receiver unplugged) stays visible with its
         // last known value for as long as the app runs.
         bool inGrace = !seen.count(it->first) && e.lastPct >= 0;
+        // ...unless the same device now answers under another id, e.g. a mouse that shows up with
+        // a different product id on its charging cable than on its receiver ("kysona:3554:F58A"
+        // vs "kysona:3554:F58C"): same driver and vendor, same kind of device.
+        if (inGrace) {
+            std::wstring family = it->first.substr(0, it->first.rfind(L':'));
+            for (auto& [k, other] : g_entries)
+                if (seen.count(k) && other.st.kind == e.st.kind && k.substr(0, k.rfind(L':')) == family) inGrace = false;
+        }
         if (inGrace) {
             e.st.connected = true;
             e.st.percent = -1;
@@ -403,7 +422,10 @@ void OnResults(std::vector<DeviceStatus>& results) {
 // widget cannot be created (e.g. Explorer not ready yet). Called once a second.
 void Reconcile() {
     bool alive = g_wantWidget && widget::Alive();
-    if (g_wantWidget && !alive) alive = widget::Create(g_inst, g_hwnd, WM_WIDGET_CLICK, g_lightTaskbar);
+    if (g_wantWidget && !alive) {
+        widget::SetAlignLeft(LoadAlignLeft());
+        alive = widget::Create(g_inst, g_hwnd, WM_WIDGET_CLICK, g_lightTaskbar);
+    }
     if (!g_wantWidget) widget::Destroy();
     bool changed = alive != g_useWidget;
     g_useWidget = alive;
@@ -449,6 +471,12 @@ void ShowMenu() {
     AppendMenuW(m, MF_STRING | (g_wantWidget ? MF_CHECKED : 0), ID_MODE_WIDGET, L"Show on the taskbar (icon + percentage)");
     AppendMenuW(m, MF_STRING | (!g_wantWidget ? MF_CHECKED : 0), ID_MODE_TRAY, L"Show as tray icons");
     CheckMenuRadioItem(m, ID_MODE_WIDGET, ID_MODE_TRAY, g_wantWidget ? ID_MODE_WIDGET : ID_MODE_TRAY, MF_BYCOMMAND);
+    if (g_wantWidget) {
+        bool left = LoadAlignLeft();
+        AppendMenuW(m, MF_STRING, ID_ALIGN_LEFT, L"    Left side of the taskbar");
+        AppendMenuW(m, MF_STRING, ID_ALIGN_RIGHT, L"    Next to the clock");
+        CheckMenuRadioItem(m, ID_ALIGN_LEFT, ID_ALIGN_RIGHT, left ? ID_ALIGN_LEFT : ID_ALIGN_RIGHT, MF_BYCOMMAND);
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_REFRESH, L"Refresh now");
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
@@ -465,6 +493,11 @@ void ShowMenu() {
         case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
         case ID_MODE_WIDGET: SetMode(true); break;
         case ID_MODE_TRAY: SetMode(false); break;
+        case ID_ALIGN_LEFT:
+        case ID_ALIGN_RIGHT:
+            SaveAlignLeft(cmd == ID_ALIGN_LEFT);
+            widget::SetAlignLeft(cmd == ID_ALIGN_LEFT);
+            break;
         case ID_EXIT: DestroyWindow(g_hwnd); break;
     }
 }
