@@ -7,8 +7,11 @@
 //  * Read: a leading 0 report ID is stripped, so data[0] is the first payload byte for
 //    unnumbered reports and the report ID for numbered ones.
 #include <windows.h>
+// Older MinGW-w64 headers (e.g. the one bundled with Strawberry Perl) lack extern "C" here.
+extern "C" {
 #include <hidsdi.h>
 #include <hidpi.h>
+}
 
 #include <initializer_list>
 #include <string>

@@ -2,11 +2,63 @@
 // 64-byte output report without report id: [01][00][81][01][0...][checksum], checksum (byte 63)
 // = 0xA1 - sum(bytes 0..62). The reply [01][..][..][01][state][rate][vid lo][vid hi][pid lo][pid hi]
 // [charging][battery %]... carries the mouse's own vendor id, which is checked so that only a
-// genuine reply is accepted. Keychron keyboards do not report their battery this way (only over
-// Bluetooth, which the Bluetooth fallback already covers).
+// genuine reply is accepted.
+//
+// Keychron keyboards on the Keychron Link receiver (3434:D030): the receiver's raw HID interface
+// (usage page FF60, usage 61, 32-byte reports, no report id) answers B2 itself with its state:
+// [B2][slots] then per slot [vid lo][vid hi][pid lo][pid hi][connected]. Stock keyboard firmware
+// never answers a battery query through the receiver; firmware with the KC_GET_BATTERY patch
+// (ldkv/qmk_firmware#1, needs WILRESS_RAW_ENABLE) answers A4 with
+// [A4][percent][mV lo][mV hi][0 = on battery / 1 = charging / 2 = full][transport][model].
+// Without that patch the query times out and nothing is reported (Bluetooth still works).
 #include "drivers.h"
 
 namespace {
+
+// Sends a 32-byte request to the receiver's raw HID interface and waits for a reply starting with `cmd`.
+bool LinkQuery(HidDev& d, BYTE cmd, std::vector<BYTE>& r, int timeoutMs) {
+    std::vector<BYTE> req(33, 0);  // report id 0 (unnumbered) + 32 bytes
+    req[1] = cmd;
+    d.Flush();
+    if (!d.Write(req)) return false;
+    ULONGLONG end = GetTickCount64() + timeoutMs;
+    for (;;) {
+        int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
+        if (left <= 0 || d.Read(r, left) < 8) return false;
+        if (r[0] == cmd) return true;
+    }
+}
+
+void PollKeychronLinkKeyboard(PollContext& ctx, USHORT vid, USHORT pid) {
+    for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) { return c.page() == 0xFF60 && c.usage() == 0x61 && c.outLen() == 33; })) {
+        HidDev d;
+        if (!d.Open(*c)) continue;
+        std::vector<BYTE> r;
+        if (!LinkQuery(d, 0xB2, r, 500)) continue;  // not a Keychron Link
+        USHORT kbPid = 0;
+        int slots = r[1] < 5 ? r[1] : 5;
+        for (int i = 0; i < slots && 2 + 5 * i + 4 < (int)r.size(); i++) {
+            const BYTE* s = &r[2 + 5 * i];
+            if ((s[0] | (s[1] << 8)) == 0x3434 && s[4]) { kbPid = (USHORT)(s[2] | (s[3] << 8)); break; }
+        }
+        if (!kbPid) return;  // keyboard off or asleep: keep the last value for a while (graceSec)
+        // After the link has been idle, the first request is lost while it wakes up (a stray reply
+        // arrives instead); a second one is answered within ~60 ms. Stock firmware never answers.
+        bool ok = LinkQuery(d, 0xA4, r, 1000) || LinkQuery(d, 0xA4, r, 1000);
+        if (!ok || r[1] > 100) return;
+        DeviceStatus s;
+        s.key = L"keychron-kb:" + Hex4(kbPid);
+        s.name = (kbPid >= 0x0A50 && kbPid <= 0x0A58) ? L"Keychron K5 Max" : L"Keychron keyboard";
+        s.kind = DeviceKind::Keyboard;
+        s.via = L"2.4 GHz receiver";
+        s.percent = r[1];
+        s.millivolts = r[2] | (r[3] << 8);
+        s.charging = r[4] == 1;
+        s.graceSec = 30 * 60;
+        ctx.Add(s, vid, pid);
+        return;
+    }
+}
 
 void SetChecksum(std::vector<BYTE>& payload) {  // payload = 64 bytes without the report id
     unsigned sum = 0;
@@ -55,5 +107,6 @@ void PollKeychron(PollContext& ctx) {
             ctx.Add(s, vid, pid);
             break;
         }
+        PollKeychronLinkKeyboard(ctx, vid, pid);
     }
 }
