@@ -23,7 +23,10 @@ constexpr UINT WM_RESULTS = WM_APP + 2;
 constexpr UINT WM_WIDGET_CLICK = WM_APP + 3;
 constexpr UINT_PTR TIMER_DEBOUNCE = 1;
 constexpr UINT_PTR TIMER_WIDGET = 2;
+constexpr UINT_PTR TIMER_WAKE_RETRY = 3;
 constexpr DWORD POLL_INTERVAL_MS = 60 * 1000;
+constexpr DWORD WAKE_IDLE_MS = 5000;        // input after this much idle time may have woken a mouse/keyboard
+constexpr UINT WAKE_RETRY_MS = 3000;        // second look, for receivers that report the wake late
 constexpr int LOW_BATTERY = 15;
 constexpr UINT PLACEHOLDER_ID = 1;
 
@@ -678,6 +681,29 @@ DWORD WINAPI Worker(LPVOID) {
 
 void RefreshSoon(UINT ms) { SetTimer(g_hwnd, TIMER_DEBOUNCE, ms, nullptr); }
 
+// A mouse or keyboard shown dimmed (asleep, last known value) that user input could wake up.
+bool InputDeviceAsleep() {
+    for (auto& [k, e] : g_entries)
+        if (e.st.connected && (e.st.asleep || e.st.percent < 0) &&
+            (e.st.kind == DeviceKind::Mouse || e.st.kind == DeviceKind::Keyboard)) return true;
+    return false;
+}
+
+// Called once a second. Mice and keyboards sleep after a few seconds of idling and only show up again
+// at the next poll (up to a minute later). When the user starts typing or moving the mouse after a
+// pause, poll right away instead (and once more shortly after), but only while one of them is asleep.
+void CheckWake() {
+    static bool wasIdle = false;
+    LASTINPUTINFO li{ sizeof(li) };
+    if (!GetLastInputInfo(&li)) return;
+    if (GetTickCount() - li.dwTime >= WAKE_IDLE_MS) { wasIdle = true; return; }
+    if (!wasIdle) return;
+    wasIdle = false;
+    if (!InputDeviceAsleep()) return;
+    SetEvent(g_refreshEvt);
+    SetTimer(g_hwnd, TIMER_WAKE_RETRY, WAKE_RETRY_MS, nullptr);
+}
+
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_taskbarCreatedMsg && msg != 0) {  // Explorer restarted
         widget::Destroy();
@@ -714,7 +740,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         case WM_TIMER:
             if (wp == TIMER_DEBOUNCE) { KillTimer(h, TIMER_DEBOUNCE); SetEvent(g_refreshEvt); }
-            if (wp == TIMER_WIDGET) Reconcile();
+            if (wp == TIMER_WIDGET) { Reconcile(); CheckWake(); }
+            if (wp == TIMER_WAKE_RETRY) { KillTimer(h, TIMER_WAKE_RETRY); if (InputDeviceAsleep()) SetEvent(g_refreshEvt); }
             return 0;
         case WM_SETTINGCHANGE:
             if (lp && !lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet")) {
