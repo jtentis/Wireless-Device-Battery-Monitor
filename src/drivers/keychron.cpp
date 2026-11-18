@@ -55,7 +55,7 @@ void PollKeychronLinkKeyboard(PollContext& ctx, USHORT vid, USHORT pid) {
         if (!d.Open(*c)) continue;
         std::vector<BYTE> r;
         USHORT kbPid = 0;
-        bool viaLink = LinkQuery(d, 0xB2, r, 500);
+        bool viaLink = LinkQuery(d, 0xB2, r, 300);
         if (viaLink) {
             int slots = r[1] < 5 ? r[1] : 5;
             for (int i = 0; i < slots && 2 + 5 * i + 4 < (int)r.size(); i++) {
@@ -64,12 +64,12 @@ void PollKeychronLinkKeyboard(PollContext& ctx, USHORT vid, USHORT pid) {
             }
             if (!kbPid) return;  // keyboard off, asleep or on the cable: the app keeps its last value
             // After the link has been idle, the first request is lost while it wakes up (a stray
-            // reply arrives instead); a second one is answered within ~60 ms.
-            if (!LinkQuery(d, 0xA4, r, 1000) && !LinkQuery(d, 0xA4, r, 1000)) return;  // stock firmware
+            // reply arrives instead); a second one is answered within ~60 ms. Worst case (stock firmware) ~1.1 s.
+            if (!LinkQuery(d, 0xA4, r, 400) && !LinkQuery(d, 0xA4, r, 400)) return;  // stock firmware
         } else {
             // Not a receiver (a keyboard answers B2 with VIA's "unhandled" FF): ask it directly.
             kbPid = pid;
-            if (!LinkQuery(d, 0xA4, r, 500)) continue;  // stock firmware answers FF, never A4
+            if (!LinkQuery(d, 0xA4, r, 400)) continue;  // stock firmware answers FF, never A4
         }
         if (r[1] > 100) return;
         DeviceStatus s;
