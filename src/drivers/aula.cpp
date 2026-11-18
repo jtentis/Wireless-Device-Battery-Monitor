@@ -331,6 +331,9 @@ void PollAula(PollContext& ctx) {
             s.via = L"2.4 GHz receiver";
             s.percent = level;
             s.charging = (r[6] >> 4) == 1;  // high nibble: AULA's 0x10 cable flag, M HUB's chargeStatus
+            // An idle keyboard sometimes misses the 4 s deadline (4 of 15 polls on an F75 that was awake);
+            // keep the last value instead of dropping the keyboard until the next poll.
+            s.graceSec = 1800;
             ctx.Add(s, vid, pid);
             break;
         }
